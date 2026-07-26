@@ -60,7 +60,7 @@ fi
 
 echo "[4/6] Installing agent..."
 cat > /opt/domainforge-agent/agent.js << 'AGENT_EOF'
-// DomainForge CloudPanel Agent v1.3
+// DomainForge CloudPanel Agent v1.4 (+EIMS file-delete)
 // HTTP API for managing CloudPanel sites
 
 const http = require('http');
@@ -307,7 +307,7 @@ const handleRequest = async (req, res) => {
         if (url === '/api/health' && method === 'GET') {
             sendJSON(res, 200, { 
                 status: 'ok', 
-                version: '1.8.0',
+                version: '1.4.0',
                 cloudpanel: fs.existsSync(CLPCTL)
             });
             return;
@@ -391,6 +391,38 @@ const handleRequest = async (req, res) => {
         // Cloudflare-only mode (placeholder)
         if ((match = url.match(/^\/api\/sites\/([^\/]+)\/cloudflare-only$/)) && method === 'POST') {
             sendJSON(res, 200, { ok: true, message: 'Configure via CloudPanel UI' });
+            return;
+        }
+        
+
+        // Batch-delete files from a site's media folder
+        // Used by EIMS Campaign Manager to clean up after campaigns
+        if ((match = url.match(/^\/api\/sites\/([^\/]+)\/files-delete$/)) && method === 'POST') {
+            const domain = decodeURIComponent(match[1]);
+            const body = await parseBody(req);
+            const filenames = Array.isArray(body.files) ? body.files : [];
+            const folder = (body.folder || 'media').replace(/\.\./g, '').replace(/\\/g, '').trim();
+            const basePath = findSiteDir(domain);
+            if (!basePath) { sendJSON(res, 404, { error: 'Site not found' }); return; }
+            
+            const results = filenames.map(fn => {
+                const safeName = path.basename(fn);  // strip any path components
+                const fp = folder ? path.join(basePath, folder, safeName) : path.join(basePath, safeName);
+                if (!path.resolve(fp).startsWith(path.resolve(basePath))) {
+                    return { filename: safeName, ok: false, error: 'Path traversal denied' };
+                }
+                try {
+                    fs.unlinkSync(fp);
+                    return { filename: safeName, ok: true };
+                } catch (e) {
+                    return { filename: safeName, ok: false, error: e.message };
+                }
+            });
+            
+            const ok   = results.filter(r => r.ok).length;
+            const fail = results.filter(r => !r.ok).length;
+            log('INFO', `Deleted ${ok}/${filenames.length} files from ${domain}/${folder}`);
+            sendJSON(res, 200, { ok, fail, results });
             return;
         }
         
