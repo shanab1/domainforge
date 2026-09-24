@@ -189,7 +189,8 @@ fi
 # ------------------------------------------------------------------
 step "[4/7] Installing agent..."
 cat > /opt/domainforge-agent/agent.js << 'AGENT_EOF'
-// DomainForge CloudPanel Agent v1.5 (+EIMS file-delete, +site creation dates)
+// DomainForge CloudPanel Agent v1.6
+// (+EIMS file-delete, +site creation dates, +PHP sites, +origin certificates)
 // HTTP API for managing CloudPanel sites
 
 const http = require('http');
@@ -203,6 +204,34 @@ const TOKEN = fs.existsSync('/etc/domainforge-agent/token')
     : '';
 const CLPCTL = '/usr/bin/clpctl';
 const SITES_PATH = '/home';
+const CERT_DIR = '/etc/domainforge-agent/certs';
+
+// CloudPanel gives every site its own user and runs that site's PHP-FPM pool
+// as that user. Writing files as www-data leaves PHP unable to read them,
+// which shows up as 403s and blank pages, so always hand ownership back.
+const ownerFor = basePath => {
+    const rel = String(basePath).startsWith(SITES_PATH + '/')
+        ? String(basePath).slice(SITES_PATH.length + 1)
+        : '';
+    const user = rel.split('/')[0];
+    return /^[A-Za-z0-9._-]+$/.test(user) ? user : 'www-data';
+};
+const fixOwnership = basePath => {
+    const owner = ownerFor(basePath);
+    return run(`chown -R ${owner}:${owner} "${basePath}" 2>/dev/null`);
+};
+
+// Highest PHP version installed, which is what a new site should use.
+const phpVersions = () => {
+    const found = [];
+    try {
+        for (const d of fs.readdirSync('/etc/php')) {
+            if (/^\d+\.\d+$/.test(d) && fs.existsSync(path.join('/etc/php', d, 'fpm'))) found.push(d);
+        }
+    } catch {}
+    found.sort((a, b) => parseFloat(a) - parseFloat(b));
+    return found;
+};
 
 const log = (level, msg) => {
     const ts = new Date().toISOString();
@@ -247,7 +276,18 @@ const getSites = () => {
                         createdFrom = 'changed';
                     }
 
-                    sites.push({ domain: sub, type: 'static', user: dir, created, createdFrom });
+                    // Read the rendered vhost to tell a PHP site from a static one.
+                    let type = 'static', phpVersion = null;
+                    try {
+                        const conf = fs.readFileSync('/etc/nginx/sites-enabled/' + sub + '.conf', 'utf8');
+                        const fpm = conf.match(/php(\d+\.\d+)-fpm|php\/php(\d+\.\d+)-fpm/);
+                        if (fpm || /fastcgi_pass/.test(conf)) {
+                            type = 'php';
+                            phpVersion = (fpm && (fpm[1] || fpm[2])) || null;
+                        }
+                    } catch {}
+
+                    sites.push({ domain: sub, type, phpVersion, user: dir, created, createdFrom });
                 }
             } catch {}
         }
@@ -257,10 +297,30 @@ const getSites = () => {
     return sites;
 };
 
-const createSite = domain => {
+const createSite = (domain, opts = {}) => {
     const siteUser = domain.replace(/\./g, '').substring(0, 32).toLowerCase();
     const sitePass = require('crypto').randomBytes(16).toString('hex');
-    return run(`${CLPCTL} site:add:static --domainName="${domain}" --siteUser="${siteUser}" --siteUserPassword="${sitePass}" 2>&1`);
+    const type = opts.type === 'php' ? 'php' : 'static';
+
+    if (type === 'static') {
+        return run(`${CLPCTL} site:add:static --domainName="${domain}" --siteUser="${siteUser}" --siteUserPassword="${sitePass}" 2>&1`);
+    }
+
+    const available = phpVersions();
+    let version = String(opts.phpVersion || '').trim();
+    if (version && !/^\d+\.\d+$/.test(version)) version = '';
+    if (version && available.length && available.indexOf(version) < 0) {
+        log('WARN', `PHP ${version} is not installed; using ${available[available.length - 1]}`);
+        version = '';
+    }
+    if (!version) version = available.length ? available[available.length - 1] : '8.3';
+
+    // Only what a template name can legitimately contain, so nothing here can
+    // alter the command being run.
+    const template = String(opts.vhostTemplate || 'Generic').replace(/[^A-Za-z0-9 ._-]/g, '') || 'Generic';
+    const r = run(`${CLPCTL} site:add:php --domainName="${domain}" --phpVersion="${version}" --vhostTemplate="${template}" --siteUser="${siteUser}" --siteUserPassword="${sitePass}" 2>&1`);
+    if (r.ok) r.phpVersion = version;
+    return r;
 };
 
 const deleteSite = domain => run(`${CLPCTL} site:delete --domainName="${domain}" --force 2>&1`);
@@ -299,7 +359,7 @@ const writeFile = (domain, filePath, content) => {
     try {
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, content);
-        run(`chown -R www-data:www-data "${basePath}" 2>/dev/null`);
+        fixOwnership(basePath);
         return { ok: true };
     } catch (e) {
         return { ok: false, err: e.message };
@@ -322,12 +382,68 @@ const extractZip = (domain, filename, base64Content, folder = '') => {
         fs.writeFileSync(tempPath, Buffer.from(base64Content, 'base64'));
         const r = run(`unzip -o "${tempPath}" -d "${targetPath}" 2>&1`);
         try { fs.unlinkSync(tempPath); } catch {}
-        run(`chown -R www-data:www-data "${basePath}" 2>/dev/null`);
+        fixOwnership(basePath);
         return r;
     } catch (e) {
         try { fs.unlinkSync(tempPath); } catch {}
         return { ok: false, err: e.message };
     }
+};
+
+// Generate a key and CSR on the server. The private key never leaves the box,
+// which is the whole point of doing it here rather than in a browser.
+const makeCsr = domain => {
+    try { fs.mkdirSync(CERT_DIR, { recursive: true, mode: 0o700 }); } catch {}
+    const keyPath = path.join(CERT_DIR, domain + '.key');
+    const csrPath = path.join(CERT_DIR, domain + '.csr');
+
+    let r = run(`openssl genrsa -out "${keyPath}" 2048 2>&1`);
+    if (!r.ok) return { ok: false, err: 'Could not generate a key: ' + r.err };
+    try { fs.chmodSync(keyPath, 0o600); } catch {}
+
+    // The subjectAltName carries the apex and the wildcard, so one certificate
+    // covers every subdomain this tool provisions.
+    const cnf = path.join(CERT_DIR, domain + '.cnf');
+    fs.writeFileSync(cnf,
+        '[req]\ndistinguished_name=dn\nreq_extensions=ext\nprompt=no\n' +
+        '[dn]\nCN=' + domain + '\n' +
+        '[ext]\nsubjectAltName=DNS:' + domain + ',DNS:*.' + domain + '\n');
+
+    r = run(`openssl req -new -key "${keyPath}" -out "${csrPath}" -config "${cnf}" 2>&1`);
+    try { fs.unlinkSync(cnf); } catch {}
+    if (!r.ok) return { ok: false, err: 'Could not generate a CSR: ' + r.err };
+
+    try {
+        return { ok: true, csr: fs.readFileSync(csrPath, 'utf8'), hostnames: [domain, '*.' + domain] };
+    } catch (e) {
+        return { ok: false, err: e.message };
+    }
+};
+
+// Install a certificate signed against the CSR above onto one or more sites.
+const installCert = (domain, certificate, sites) => {
+    const keyPath = path.join(CERT_DIR, domain + '.key');
+    if (!fs.existsSync(keyPath)) {
+        return { ok: false, err: 'No private key for ' + domain + '. Ask for a CSR first.' };
+    }
+    if (!/BEGIN CERTIFICATE/.test(String(certificate || ''))) {
+        return { ok: false, err: 'That does not look like a PEM certificate' };
+    }
+
+    const certPath = path.join(CERT_DIR, domain + '.crt');
+    fs.writeFileSync(certPath, certificate, { mode: 0o600 });
+
+    const targets = Array.isArray(sites) && sites.length ? sites : [domain];
+    const results = [];
+    for (const site of targets) {
+        const safe = String(site).replace(/["`$\\;|&]/g, '');
+        const r = run(`${CLPCTL} site:install:certificate --domainName="${safe}" --privateKey="${keyPath}" --certificate="${certPath}" 2>&1`);
+        results.push({ site: safe, ok: r.ok, out: (r.out || r.err || '').slice(0, 400) });
+        log(r.ok ? 'INFO' : 'ERROR', `Certificate install for ${safe}: ${r.ok ? 'ok' : (r.err || '').slice(0, 200)}`);
+    }
+
+    const okCount = results.filter(x => x.ok).length;
+    return { ok: okCount > 0, installed: okCount, total: results.length, results };
 };
 
 const sendJSON = (res, statusCode, data) => {
@@ -366,10 +482,46 @@ const handleRequest = async (req, res) => {
         if (url === '/api/health' && method === 'GET') {
             sendJSON(res, 200, {
                 status: 'ok',
-                version: '1.5.0',
+                version: '1.6.0',
                 node: process.version,
-                cloudpanel: fs.existsSync(CLPCTL)
+                cloudpanel: fs.existsSync(CLPCTL),
+                php: phpVersions()
             });
+            return;
+        }
+
+        // Which PHP versions this box actually has
+        if (url === '/api/php-versions' && method === 'GET') {
+            const versions = phpVersions();
+            sendJSON(res, 200, {
+                versions,
+                recommended: versions.length ? versions[versions.length - 1] : null
+            });
+            return;
+        }
+
+        // Ask for a CSR covering the domain and its wildcard
+        if (url === '/api/certificates/csr' && method === 'POST') {
+            const body = await parseBody(req);
+            if (!body.domain) { sendJSON(res, 400, { error: 'Missing domain' }); return; }
+            const r = makeCsr(String(body.domain).replace(/[^A-Za-z0-9.\-]/g, ''));
+            sendJSON(res, r.ok ? 200 : 500, r);
+            return;
+        }
+
+        // Install the signed certificate on one or more sites
+        if (url === '/api/certificates/install' && method === 'POST') {
+            const body = await parseBody(req);
+            if (!body.domain || !body.certificate) {
+                sendJSON(res, 400, { error: 'Missing domain or certificate' });
+                return;
+            }
+            const r = installCert(
+                String(body.domain).replace(/[^A-Za-z0-9.\-]/g, ''),
+                body.certificate,
+                body.sites
+            );
+            sendJSON(res, r.ok ? 200 : 500, r);
             return;
         }
 
@@ -381,9 +533,15 @@ const handleRequest = async (req, res) => {
         if (url === '/api/sites' && method === 'POST') {
             const body = await parseBody(req);
             if (!body.domain) { sendJSON(res, 400, { error: 'Missing domain' }); return; }
-            const r = createSite(body.domain);
+            const r = createSite(body.domain, {
+                type: body.type,
+                phpVersion: body.phpVersion,
+                vhostTemplate: body.vhostTemplate
+            });
             sendJSON(res, r.ok ? 201 : 500,
-                r.ok ? { message: 'Site created', domain: body.domain } : { error: r.err || r.out });
+                r.ok
+                    ? { message: 'Site created', domain: body.domain, type: body.type === 'php' ? 'php' : 'static', phpVersion: r.phpVersion || null }
+                    : { error: r.err || r.out });
             return;
         }
 
@@ -475,7 +633,7 @@ const handleRequest = async (req, res) => {
 
 http.createServer(handleRequest).listen(PORT, '0.0.0.0', () => {
     log('INFO', '========================================');
-    log('INFO', 'DomainForge CloudPanel Agent v1.5');
+    log('INFO', 'DomainForge CloudPanel Agent v1.6');
     log('INFO', `Listening on http://0.0.0.0:${PORT}`);
     log('INFO', `Node: ${process.version}`);
     log('INFO', `Token: ${TOKEN ? 'CONFIGURED' : 'NOT SET (insecure)'}`);
