@@ -22,6 +22,11 @@
 
 set -euo pipefail
 
+# CloudPanel's PHP vhosts put a backend listener on 8080, so the agent must
+# not sit there. A collision stops nginx binding, which stops it loading any
+# new configuration at all — certificates and vhosts silently never take effect.
+AGENT_PORT=8090
+
 NODE_PREFERRED=24          # Active LTS
 NODE_FALLBACK=22           # Maintenance LTS
 NODE_MINIMUM=18            # the agent needs nothing newer than this
@@ -164,6 +169,40 @@ node -e 'process.exit(0)' >>"$LOG" 2>&1 || die "Node.js is installed but will no
 # ------------------------------------------------------------------
 # 2. Directories
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 1b. Port
+# ------------------------------------------------------------------
+step "[1b/7] Choosing a port..."
+
+port_free() {
+    ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+}
+
+if ! port_free "$AGENT_PORT"; then
+    holder="$(ss -tlnp 2>/dev/null | grep -E "[:.]${AGENT_PORT}\b" | head -1)"
+    # An agent already running here is fine; we are about to replace it.
+    if echo "$holder" | grep -q 'domainforge\|node'; then
+        ok "Port $AGENT_PORT is held by an existing agent, which will be replaced"
+    else
+        warn "Port $AGENT_PORT is in use by something else:"
+        echo "       $holder"
+        for candidate in 8091 8092 8093 9080 9090; do
+            if port_free "$candidate"; then
+                AGENT_PORT="$candidate"
+                ok "Using port $AGENT_PORT instead"
+                break
+            fi
+        done
+    fi
+else
+    ok "Port $AGENT_PORT is free"
+fi
+
+if [ "$AGENT_PORT" = "8080" ]; then
+    warn "8080 is what CloudPanel uses for PHP site backends. A collision there"
+    warn "stops nginx loading new configuration at all. Strongly consider another port."
+fi
+
 step "[2/7] Creating directories..."
 mkdir -p /opt/domainforge-agent /etc/domainforge-agent
 ok "Directories created"
@@ -188,7 +227,10 @@ fi
 # 4. Agent
 # ------------------------------------------------------------------
 step "[4/7] Installing agent..."
-cat > /opt/domainforge-agent/agent.js << 'AGENT_EOF'
+cat > /opt/domainforge-agent/agent.js << AGENT_HEADER_EOF
+// port chosen by the installer
+AGENT_HEADER_EOF
+cat >> /opt/domainforge-agent/agent.js << 'AGENT_EOF'
 // DomainForge CloudPanel Agent v1.6
 // (+EIMS file-delete, +site creation dates, +PHP sites, +origin certificates)
 // HTTP API for managing CloudPanel sites
@@ -198,7 +240,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const PORT = 8080;
+const PORT = __AGENT_PORT__;
 const TOKEN = fs.existsSync('/etc/domainforge-agent/token')
     ? fs.readFileSync('/etc/domainforge-agent/token', 'utf8').trim()
     : '';
@@ -446,6 +488,115 @@ const installCert = (domain, certificate, sites) => {
     return { ok: okCount > 0, installed: okCount, total: results.length, results };
 };
 
+// Everything Cloudflare needs from the origin to complete a handshake, checked
+// one link at a time so a 525 stops being a guessing game.
+const diagnose = domain => {
+    const out = { domain, checks: [] };
+    const add = (name, ok, detail) => out.checks.push({ name, ok, detail: String(detail || '').slice(0, 500) });
+
+    // 1. does the site exist here at all
+    const confPath = '/etc/nginx/sites-enabled/' + domain + '.conf';
+    const hasVhost = fs.existsSync(confPath);
+    add('nginx has a vhost for this domain', hasVhost,
+        hasVhost ? confPath : 'No ' + confPath + '. The site is not on this server, so nginx has nothing to answer with.');
+
+    let conf = '';
+    if (hasVhost) { try { conf = fs.readFileSync(confPath, 'utf8'); } catch (e) { add('vhost readable', false, e.message); } }
+
+    // 2. is it configured for TLS
+    const listens = /listen\s+443/.test(conf);
+    add('the vhost listens on 443', listens, listens ? 'yes' : 'No listen 443 directive.');
+
+    const certPath = (conf.match(/ssl_certificate\s+([^;]+);/) || [])[1];
+    const keyPath = (conf.match(/ssl_certificate_key\s+([^;]+);/) || [])[1];
+    add('a certificate is configured', !!certPath, certPath ? certPath.trim() : 'No ssl_certificate directive.');
+
+    // 3. is the certificate actually usable
+    if (certPath) {
+        const cp = certPath.trim(), kp = (keyPath || '').trim();
+        const certThere = fs.existsSync(cp);
+        add('the certificate file exists', certThere, certThere ? cp : 'Missing: ' + cp);
+
+        if (certThere) {
+            const info = run(`openssl x509 -in "${cp}" -noout -subject -issuer -dates 2>&1`);
+            const sans = run(`openssl x509 -in "${cp}" -noout -ext subjectAltName 2>&1`);
+            out.certificate = {
+                issuer: (info.out.match(/issuer=(.*)/) || [])[1] || '',
+                subject: (info.out.match(/subject=(.*)/) || [])[1] || '',
+                notAfter: (info.out.match(/notAfter=(.*)/) || [])[1] || '',
+                names: (sans.out.match(/DNS:[^,\n]+/g) || []).map(x => x.replace('DNS:', '').trim())
+            };
+
+            const notExpired = run(`openssl x509 -in "${cp}" -noout -checkend 0 2>&1`);
+            add('the certificate has not expired', notExpired.ok,
+                notExpired.ok ? 'expires ' + out.certificate.notAfter : 'Expired on ' + out.certificate.notAfter);
+
+            const names = out.certificate.names;
+            const covered = names.some(n =>
+                n.toLowerCase() === domain.toLowerCase() ||
+                (n.startsWith('*.') && domain.toLowerCase().endsWith(n.slice(1).toLowerCase())));
+            add('the certificate covers this hostname', covered,
+                covered ? names.join(', ') : 'Covers ' + (names.join(', ') || 'nothing') + ', but not ' + domain);
+
+            if (kp && fs.existsSync(kp)) {
+                const cmod = run(`openssl x509 -noout -modulus -in "${cp}" 2>/dev/null | openssl md5`);
+                const kmod = run(`openssl rsa -noout -modulus -in "${kp}" 2>/dev/null | openssl md5`);
+                const pair = cmod.ok && kmod.ok && cmod.out === kmod.out;
+                add('the key matches the certificate', pair,
+                    pair ? 'yes' : 'The private key does not belong to this certificate, so nginx cannot complete a handshake.');
+            } else {
+                add('the private key exists', false, 'Missing: ' + (kp || 'no ssl_certificate_key directive'));
+            }
+        }
+    }
+
+    // 4. is nginx actually serving it
+    const ngt = run('nginx -t 2>&1');
+    add('the nginx configuration is valid', ngt.ok, ngt.out || ngt.err);
+
+    const listening = run("ss -tln 2>/dev/null | grep -c ':443' || true");
+    const is443 = parseInt((listening.out || '0').trim(), 10) > 0;
+    add('something is listening on 443', is443, is443 ? 'yes' : 'Nothing bound to 443.');
+
+    // 5. the actual handshake, with the SNI Cloudflare would send
+    const hs = run(`echo | timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "${domain}" 2>&1 | head -30`);
+    const served = (hs.out.match(/subject=.*/) || [])[0] || '';
+    const handshakeOk = /BEGIN CERTIFICATE|subject=/.test(hs.out) && !/handshake failure|no peer certificate|alert/i.test(hs.out);
+    add('a TLS handshake for this hostname succeeds locally', handshakeOk,
+        handshakeOk
+            ? 'served ' + served
+            : 'This is what Cloudflare sees. ' + (hs.out || '').slice(0, 300));
+
+    // 6. PHP, where relevant
+    const isPhp = /fastcgi_pass/.test(conf);
+    out.type = isPhp ? 'php' : 'static';
+    if (isPhp) {
+        const sock = (conf.match(/fastcgi_pass\s+unix:([^;]+);/) || [])[1];
+        const sockThere = sock ? fs.existsSync(sock.trim()) : false;
+        add('the PHP-FPM socket exists', sockThere,
+            sockThere ? sock.trim() : 'Missing: ' + (sock || 'no fastcgi_pass') + '. PHP will 502.');
+
+        const base = findSiteDir(domain);
+        if (base) {
+            const idx = path.join(base, 'index.php');
+            const hasIndex = fs.existsSync(idx);
+            add('index.php is present', hasIndex, hasIndex ? idx : 'No index.php in ' + base);
+            if (hasIndex) {
+                const owner = ownerFor(base);
+                const st = fs.statSync(idx);
+                const uid = run(`id -u ${owner} 2>/dev/null`);
+                const rightOwner = uid.ok && String(st.uid) === uid.out.trim();
+                add('the files belong to the site user', rightOwner,
+                    rightOwner ? owner : 'Owned by uid ' + st.uid + ' but PHP-FPM runs as ' + owner + '. This causes 403s and blank pages.');
+            }
+        }
+    }
+
+    out.ok = out.checks.every(c => c.ok);
+    out.firstProblem = (out.checks.filter(c => !c.ok)[0] || {}).name || null;
+    return out;
+};
+
 const sendJSON = (res, statusCode, data) => {
     res.writeHead(statusCode, {
         'Content-Type': 'application/json',
@@ -478,6 +629,7 @@ const handleRequest = async (req, res) => {
 
     log('INFO', `${method} ${url}`);
 
+    let match;
     try {
         if (url === '/api/health' && method === 'GET') {
             sendJSON(res, 200, {
@@ -525,6 +677,11 @@ const handleRequest = async (req, res) => {
             return;
         }
 
+        if ((match = url.match(/^\/api\/sites\/([^\/]+)\/diagnose$/)) && method === 'GET') {
+            sendJSON(res, 200, diagnose(decodeURIComponent(match[1]).replace(/[^A-Za-z0-9.\-]/g, '')));
+            return;
+        }
+
         if (url === '/api/sites' && method === 'GET') {
             sendJSON(res, 200, { sites: getSites() });
             return;
@@ -544,8 +701,6 @@ const handleRequest = async (req, res) => {
                     : { error: r.err || r.out });
             return;
         }
-
-        let match;
 
         if ((match = url.match(/^\/api\/sites\/([^\/]+)$/)) && method === 'DELETE') {
             const domain = decodeURIComponent(match[1]);
@@ -645,6 +800,7 @@ process.on('SIGTERM', () => { log('INFO', 'Shutting down...'); process.exit(0); 
 process.on('SIGINT', () => { log('INFO', 'Shutting down...'); process.exit(0); });
 AGENT_EOF
 
+sed -i "s/__AGENT_PORT__/${AGENT_PORT}/" /opt/domainforge-agent/agent.js
 node --check /opt/domainforge-agent/agent.js >>"$LOG" 2>&1 || die "The agent file did not write correctly"
 ok "Agent installed"
 
@@ -690,19 +846,19 @@ ok "Service created and started"
 # ------------------------------------------------------------------
 step "[6/7] Configuring firewall..."
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
-    ufw allow 8080/tcp >>"$LOG" 2>&1 || true
-    ok "Port 8080 opened in UFW"
+    ufw allow ${AGENT_PORT}/tcp >>"$LOG" 2>&1 || true
+    ok "Port $AGENT_PORT opened in UFW"
 elif command -v ufw >/dev/null 2>&1; then
     ok "UFW present but inactive, nothing to open"
 else
-    warn "UFW not found. Open port 8080 yourself if a firewall is in the way."
+    warn "UFW not found. Open port $AGENT_PORT yourself if a firewall is in the way."
 fi
 
 # ------------------------------------------------------------------
 # 7. Self-test
 # ------------------------------------------------------------------
 step "[7/7] Testing the agent..."
-HEALTH="$(curl -s --max-time 10 -H "X-Agent-Token: $TOKEN" http://localhost:8080/api/health 2>>"$LOG" || true)"
+HEALTH="$(curl -s --max-time 10 -H "X-Agent-Token: $TOKEN" http://localhost:${AGENT_PORT}/api/health 2>>"$LOG" || true)"
 if echo "$HEALTH" | grep -q '"status":"ok"'; then
     ok "Agent responded on localhost"
     echo "$HEALTH" | grep -q '"cloudpanel":true' \
@@ -722,7 +878,7 @@ echo ""
 echo "  Copy these into DomainForge:"
 echo ""
 echo "    Agent IP : $SERVER_IP"
-echo "    Port     : 8080"
+echo "    Port     : $AGENT_PORT"
 echo "    Token    : $TOKEN"
 echo ""
 echo "  Node.js    : $(node -v)"
@@ -730,7 +886,7 @@ echo "  Service    : $(systemctl is-active domainforge-agent)"
 echo "  Install log: $LOG"
 echo ""
 echo "  Test from your machine:"
-echo "    curl -H \"X-Agent-Token: $TOKEN\" http://$SERVER_IP:8080/api/health"
+echo "    curl -H \"X-Agent-Token: $TOKEN\" http://$SERVER_IP:$AGENT_PORT/api/health"
 echo ""
 echo "  Live logs:"
 echo "    journalctl -u domainforge-agent -f"
